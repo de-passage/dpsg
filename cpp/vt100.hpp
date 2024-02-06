@@ -12,6 +12,9 @@ template <std::size_t S, char End = 0, char Begin = 0> struct termcode_sequence 
   uint8_t codes[S];
 };
 
+template <char End, char Begin> struct termcode_sequence<0, End, Begin> {
+};
+
 namespace detail {
 template<char B, char E, class ...Chars>
 inline constexpr termcode_sequence<sizeof...(Chars), E, B> termcode_sequence_from(Chars... chars) noexcept {
@@ -184,10 +187,6 @@ inline constexpr auto set_cursor(uint8_t x, uint8_t y) noexcept {
 static inline constexpr auto hide_cursor = detail::termcode_sequence_from<'?', 'l'>(25);
 static inline constexpr auto show_cursor = detail::termcode_sequence_from<'?', 'h'>(25);
 
-// Deliberately not supported. Getting the current cursor position involves
-// juggling between stdin and the terminal code output. Use ncurses if you need
-// something this complex.
-// static constexpr inline termcode<'n'> get_cursor{'6'};
 static constexpr inline single_termcode<'H'> home_cursor{};
 
 // TRUE COLORS
@@ -249,4 +248,166 @@ std::ostream &operator<<(std::ostream &os, const generic_decorate<S, T> &d) {
   return os << d.codes << d.value << reset;
 }
 } // namespace dpsg::vt100
+
+#include <algorithm>
+
+namespace dpsg::vt100 {
+
+extern "C" {
+#include <termios.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+}
+
+inline void raw_mode_enable(struct termios *ctx) {
+  tcgetattr(STDIN_FILENO, ctx);
+  struct termios raw = *ctx;
+  raw.c_lflag &= ~(ECHO | ICANON);
+  tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+}
+
+inline void raw_mode_disable(struct termios *ctx) {
+  tcsetattr(STDIN_FILENO, TCSAFLUSH, ctx);
+}
+
+struct cursor_position {
+  int col;
+  int row;
+};
+struct terminal_size {
+  int col;
+  int row;
+};
+
+struct raw_mode_context {
+  struct termios orig_termios;
+
+  raw_mode_context() noexcept { raw_mode_enable(&orig_termios); }
+
+  raw_mode_context(const raw_mode_context &) = delete;
+  raw_mode_context &operator=(const raw_mode_context &) = delete;
+  raw_mode_context(raw_mode_context &&) = delete;
+  raw_mode_context &operator=(raw_mode_context &&) = delete;
+
+  ~raw_mode_context() noexcept { raw_mode_disable(&orig_termios); }
+
+  struct cursor_position cursor_position() const {
+    struct cursor_position p = {.col = 0, .row = 0};
+    char buf[32];
+    ssize_t i = 0; // Number of known characters in the buffer
+    write(STDOUT_FILENO, "\033[6n", 4);
+
+    enum class state : char {
+      start,
+      esc,
+      bracket,
+      semicolon,
+      end
+    } state = state::start;
+    for (;;) {
+      const auto e = read(STDIN_FILENO, buf + i, sizeof(buf) - i);
+      if (e < 0) {
+        // There was an error
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          // But we can recover
+          continue;
+        } else {
+          // We can't recover, return an invalid position
+          p = {-1, -1};
+          goto abort;
+        }
+      } else if (e == 0) [[unlikely]] {
+        // Not enough characters to form a valid response
+        p = {-1, -1};
+        goto abort;
+      } else [[likely]] {
+        // We need to extract the response from the buffer
+        // The response is of the form \033[<row>;<col>R
+        char *const end = buf + i + e;
+        char *begin = buf + i;
+        if (state == state::start) [[likely]] {
+          begin = std::find(begin, end, '\033');
+          if (begin == end) {
+            // No response yet
+            continue;
+          }
+          state = state::esc;
+          if (++begin == end) [[unlikely]] {
+            continue;
+          }
+        }
+
+        // consume the bracket, if not present, return an invalid position
+        if (state == state::esc) [[likely]] {
+          if (*begin != '[') [[unlikely]] {
+            // Not a valid response
+            p = {-1, -1};
+            goto abort;
+          }
+          state = state::bracket;
+          if (++begin == end) [[unlikely]] {
+            continue;
+          }
+        }
+
+        // consume the row, if not present, return an invalid position
+        if (state == state::bracket) [[likely]] {
+          for (; begin != end; ++begin) {
+            if (isdigit(*begin)) {
+              p.row = p.row * 10 + (*begin - '0');
+            } else if (*begin == ';') {
+              begin++;
+              state = state::semicolon;
+              break;
+            } else [[unlikely]] {
+              // Not a valid response
+              p = {-1, -1};
+              goto abort;
+            }
+          }
+        }
+
+        // consume the column, if not present, return an invalid position
+        if (state == state::semicolon) [[likely]] {
+          for (; begin != end; ++begin) {
+            if (isdigit(*begin)) {
+              p.col = p.col * 10 + (*begin - '0');
+            } else if (*begin == 'R') {
+              state = state::end;
+              goto abort;
+            } else [[unlikely]] {
+              // Not a valid response
+              p = {-1, -1};
+              goto abort;
+            }
+          }
+        }
+      }
+    }
+  abort:
+    return p;
+  }
+};
+
+template <std::invocable<raw_mode_context &> F>
+std::invoke_result_t<F, raw_mode_context &> with_raw_mode(F &&f) {
+  raw_mode_context ctx;
+  return f(ctx);
+}
+
+inline terminal_size get_terminal_size() {
+  struct winsize w;
+  char *col = getenv("COLUMNS");
+  char *row = getenv("LINES");
+  if (col != nullptr && row != nullptr) {
+    return {std::atoi(col), std::atoi(row)};
+  }
+
+  if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == -1) {
+    return {-1,-1};
+  }
+  return {w.ws_col, w.ws_row};
+}
+} // namespace dpsg::vt100
+
 #endif // HEADER_GUARD_DPSG_VT100_HPP

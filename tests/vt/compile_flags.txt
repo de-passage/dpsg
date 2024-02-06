@@ -1,0 +1,6 @@
+-std=c++2b
+-Wall
+-Wextra
+-Werror
+-pedantic
+-I../../cpp/
