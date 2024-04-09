@@ -9,3 +9,7 @@ using u8 = uint8_t;
 using u16 = uint16_t;
 using u32 = uint32_t;
 using u64 = uint64_t;
+
+inline u16 operator ""_u16(unsigned long long val) {
+  return static_cast<u16>(val);
+}

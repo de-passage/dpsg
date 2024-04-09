@@ -2,6 +2,7 @@
 
 #include <coroutine>
 #include <exception>
+#include <type_traits>
 
 namespace dpsg {
 
@@ -21,8 +22,10 @@ template <class T, class R = void> struct generator {
       return generator{handle_type::from_promise(*this)};
     }
     void unhandled_exception() { exception_ = std::current_exception(); }
-    auto yield_value(T &&str) -> std::suspend_always {
-      value = std::forward<T>(str);
+
+    template<class U> requires std::is_convertible_v<U, T>
+    auto yield_value(U &&str) -> std::suspend_always {
+      value = std::forward<U>(str);
       return {};
     }
 
@@ -84,8 +87,9 @@ struct generator<T, void> {
       return generator{handle_type::from_promise(*this)};
     }
     void unhandled_exception() { exception_ = std::current_exception(); }
-    auto yield_value(T &&str) -> std::suspend_always {
-      value = std::forward<T>(str);
+    template<class U> requires std::is_convertible_v<U, T>
+    auto yield_value(U &&str) -> std::suspend_always {
+      value = std::forward<U>(str);
       return {};
     }
 
