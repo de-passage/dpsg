@@ -4,6 +4,7 @@
 #include "types.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cassert>
 #include <cctype>
 #include <cerrno>
@@ -21,22 +22,57 @@ struct errno_exception : std::runtime_error {
   int code{errno};
 };
 
-struct unfinished_sequence : std::runtime_error {
+struct invalid_sequence : std::runtime_error {
+
   template <typename T>
     requires std::is_constructible_v<std::runtime_error, T>
-  unfinished_sequence(T &&param) : std::runtime_error(std::forward<T>(param)) {}
+  invalid_sequence(T &&param) : std::runtime_error(std::forward<T>(param)) {}
+
+  [[nodiscard]] virtual std::string_view buffer() const = 0;
 };
 
-struct unfinished_numeric_sequence : unfinished_sequence {
-  unfinished_numeric_sequence(const u16 *beg, const u16 *end, char er)
-      : unfinished_sequence(
+namespace detail {
+template <size_t BufSize> struct invalid_sequence_impl : invalid_sequence {
+  template <typename T>
+    requires std::is_constructible_v<std::runtime_error, T>
+  invalid_sequence_impl(const char (&buf)[BufSize], T &&param)
+      : invalid_sequence{std::forward<T>(param)} {
+    memcpy(buffer_, buf, last_);
+  }
+  template <typename T>
+    requires std::is_constructible_v<std::runtime_error, T>
+  invalid_sequence_impl(const char *buf, size_t last, T &&param)
+      : invalid_sequence{std::forward<T>(param)}, last_{last} {
+    memcpy(buffer_, buf, last_);
+  }
+
+private:
+  char buffer_[BufSize];
+  size_t last_{BufSize};
+
+public:
+  [[nodiscard]] std::string_view buffer() const override {
+    return {buffer_, last_};
+  }
+};
+} // namespace detail
+
+template <size_t BufSize>
+struct unfinished_numeric_sequence : detail::invalid_sequence_impl<BufSize> {
+  unfinished_numeric_sequence(const char *buf, size_t last, const u16 *beg,
+                              const u16 *end, char er)
+      : detail::invalid_sequence_impl<BufSize>(
+            buf, last,
             std::format("Unfinished numeric sequence in terminal control "
-                        "output (terminate with '{}')",
-                        er)),
+                        "output (terminate with '<{}>')",
+                        (int)er)),
         size{end - beg}, numeric_values{(u16 *)malloc(sizeof(*beg) * size)},
         error_character{er} {
     memcpy(numeric_values, beg, size * sizeof(*beg));
   }
+  unfinished_numeric_sequence(char (&buf)[BufSize], const u16 *beg,
+                              const u16 *end, char er)
+      : unfinished_numeric_sequence{buf, BufSize, beg, end, er} {}
   ~unfinished_numeric_sequence() override { free(numeric_values); }
 
   unfinished_numeric_sequence(const unfinished_numeric_sequence &) = delete;
@@ -50,12 +86,49 @@ struct unfinished_numeric_sequence : unfinished_sequence {
   u16 *numeric_values;
   char error_character;
 };
+template <size_t BufSize>
+unfinished_numeric_sequence(char (&)[BufSize], const u16 *beg, const u16 *end,
+                            char er) -> unfinished_numeric_sequence<BufSize>;
+template <size_t BufSize>
+unfinished_numeric_sequence(char (&)[BufSize], size_t last, const u16 *beg,
+                            const u16 *end, char er)
+    -> unfinished_numeric_sequence<BufSize>;
 
-struct invalid_sequence_start : unfinished_sequence {
-  invalid_sequence_start(char c)
-      : unfinished_sequence(std::format(
-            "Invalid sequence start '{}' in terminal control output", c)) {}
+template <size_t BufSize>
+struct invalid_sequence_start : detail::invalid_sequence_impl<BufSize> {
+  invalid_sequence_start(const char (&buf)[BufSize], char c)
+      : invalid_sequence_start{buf, BufSize, c} {}
+  invalid_sequence_start(const char *buf, size_t last, char c)
+      : detail::invalid_sequence_impl<BufSize>(
+            buf, last,
+            std::format(
+                "Invalid sequence start <{}> in terminal control output",
+                (int)c)) {}
 };
+template <size_t BufSize>
+invalid_sequence_start(char (&)[BufSize], char c)
+    -> invalid_sequence_start<BufSize>;
+template <size_t BufSize>
+invalid_sequence_start(char (&)[BufSize], size_t last, char c)
+    -> invalid_sequence_start<BufSize>;
+
+template <size_t BufSize>
+struct invalid_function_key : detail::invalid_sequence_impl<BufSize> {
+  invalid_function_key(const char (&buf)[BufSize], char c)
+      : invalid_function_key{buf, BufSize, c} {}
+  invalid_function_key(const char *buf, size_t last, char c)
+      : detail::invalid_sequence_impl<BufSize>(
+            buf, last,
+            std::format("Invalid function key ending with <{}> in terminal "
+                        "control output",
+                        (int)c)) {}
+};
+template <size_t BufSize>
+invalid_function_key(char (&)[BufSize], char c)
+    -> invalid_function_key<BufSize>;
+template <size_t BufSize>
+invalid_function_key(char (&)[BufSize], size_t last, char c)
+    -> invalid_function_key<BufSize>;
 
 extern "C" {
 #include <poll.h>
@@ -94,6 +167,8 @@ inline void disable_mouse_tracking() {
   fsync(STDOUT_FILENO);
 }
 
+inline void query_cursor_position() { write(STDOUT_FILENO, "\033[6n", 4); }
+
 struct term_position {
   union {
     struct {
@@ -111,165 +186,345 @@ struct terminal_size {
   int row;
 };
 
-struct event_key {
-  enum class funckey_modifiers : u8 {
-    Shift = 2,
-    Alt = 3,
-    Shift_Alt = 4,
-    Control = 5,
-    Shift_Control = 6,
-    Alt_Control = 7,
-    Shift_Alt_Control = 8
-  };
-
-  enum class modifiers : u8 {
-    None = 0,
-    Shift = 4,
-    Alt = 8,
-    Ctrl = 16,
-    Special = 64,
-    Key_Marker = 1 << 7,
-  };
-
-  explicit constexpr event_key() = default;
-  explicit constexpr event_key(
-      char value,
-      event_key::modifiers mods = event_key::modifiers::None) noexcept
-      : code{(u8)value}, mods{mods | event_key::modifiers::Key_Marker} {}
-
-  u8 code;
-  u8 cont[3]{};
-  u8 _padding[3]{};
-  modifiers mods;
-
-  friend constexpr modifiers operator&(modifiers left,
-                                       modifiers right) noexcept {
-    return static_cast<modifiers>(static_cast<u8>(left) &
-                                  static_cast<u8>(right));
-  }
-  friend constexpr modifiers operator|(modifiers left,
-                                       modifiers right) noexcept {
-    return static_cast<modifiers>(static_cast<u8>(left) |
-                                  static_cast<u8>(right));
-  }
-  friend constexpr event_key operator|(event_key left,
-                                       modifiers right) noexcept {
-    left.mods = left.mods | right;
-    return left;
-  }
-};
-
-struct event_mouse {
-  enum class buttons {
-    Left = 0,
-    Middle = 1,
-    Right = 2,
-    Move = 3,
-    WheelUp = 65,
-    WheelDown = 66,
-  };
-  enum class modifiers : u8 {
-    None = 0,
-    Button1 = 0,
-    Button2 = 1,
-    Button3 = 2,
-    Unused = 3, // Extended mode doesn't use this
-    Shift = 4,
-    Alt = 8,
-    Ctrl = 16,
-    Release = 32,
-    Move = 35, // Release + Release (Unused) == drag
-    WheelUp = 64,
-    WheelDown = 65,
-    Key_Marker = 1 << 7,
-  };
-
-  explicit constexpr event_mouse() = default;
-  explicit constexpr event_mouse(modifiers magic, term_position pos)
-      : x{pos.col}, y{pos.row}, mods(magic) {}
-  explicit constexpr event_mouse(buttons button, term_position pos)
-      : x{pos.col}, y{pos.row}, mods((modifiers)button) {}
-
-  u16 x;
-  u16 y;
-  u8 _padding[3];
-  modifiers mods;
-
-  [[nodiscard]] constexpr buttons button() const { return (buttons)(mods ^ modifiers::Release); }
-
-  friend constexpr modifiers operator&(modifiers left,
-                                       modifiers right) noexcept {
-    return static_cast<modifiers>(static_cast<u8>(left) &
-                                  static_cast<u8>(right));
-  }
-  friend constexpr modifiers operator|(modifiers left,
-                                       modifiers right) noexcept {
-    return static_cast<modifiers>(static_cast<u8>(left) |
-                                  static_cast<u8>(right));
-  }
-  friend constexpr modifiers operator^(modifiers left,
-                                       modifiers right) noexcept {
-    return static_cast<modifiers>(static_cast<u8>(left) ^
-                                  static_cast<u8>(right));
-  }
-};
-
 struct event {
 
-  explicit constexpr event() : _cheat_{0} {}
-  constexpr event(event_key key) : key{key} {}
-  constexpr event(event_mouse mouse) : mouse{mouse} {}
+  struct key {
+    enum class funckey_modifiers : u8 {
+      Shift = 2,
+      Alt = 3,
+      Shift_Alt = 4,
+      Control = 5,
+      Shift_Control = 6,
+      Alt_Control = 7,
+      Shift_Alt_Control = 8
+    };
+
+    enum class modifiers : u8 {
+      None = 0,
+      Shift = 4,
+      Alt = 8,
+      Ctrl = 16,
+      Unicode = 32,
+      Special = 64,
+      Key_Marker = 1 << 7,
+    };
+
+    explicit constexpr key() = default;
+    explicit constexpr key(char value,
+                           key::modifiers mods = key::modifiers::None) noexcept
+        : code{value}, mods{mods | key::modifiers::Key_Marker} {}
+
+    union {
+      struct {
+        char code;
+        char cont[3]{};
+        u8 _padding[3]{};
+        modifiers mods;
+      };
+      char data[8];
+    };
+
+    friend constexpr modifiers operator&(modifiers left,
+                                         modifiers right) noexcept {
+      return static_cast<modifiers>(static_cast<u8>(left) &
+                                    static_cast<u8>(right));
+    }
+    friend constexpr modifiers operator|(modifiers left,
+                                         modifiers right) noexcept {
+      return static_cast<modifiers>(static_cast<u8>(left) |
+                                    static_cast<u8>(right));
+    }
+    friend constexpr key operator|(key left, modifiers right) noexcept {
+      left.mods = left.mods | right;
+      return left;
+    }
+
+    [[nodiscard]] constexpr bool is_unicode() const {
+      return (((u32)code >> 6) & 0b11) == 0b11;
+    }
+
+    [[nodiscard]] constexpr size_t code_point_count() const {
+      if (code >= 0) {
+        return 1;
+      }
+      return std::countl_one((unsigned char)code);
+    }
+
+    [[nodiscard]] constexpr std::string_view code_points() const {
+      return std::string_view{data, code_point_count()};
+    }
+
+    [[nodiscard]] constexpr bool same_key(key other) const {
+      return code_points() == other.code_points() &&
+             is_function_key() == other.is_function_key();
+    }
+
+    [[nodiscard]] constexpr bool is_function_key() const {
+      return (mods & modifiers::Special) == modifiers::Special;
+    }
+
+    [[nodiscard]] constexpr bool ctrl_pressed() const {
+      return (mods & modifiers::Ctrl) == modifiers::Ctrl;
+    }
+
+    [[nodiscard]] constexpr bool alt_pressed() const {
+      return (mods & modifiers::Alt) == modifiers::Alt;
+    }
+
+    [[nodiscard]] constexpr bool shift_pressed() const {
+      return (mods & modifiers::Shift) == modifiers::Shift;
+    }
+  };
+
+  struct mouse {
+    enum class buttons {
+      Left = 0,
+      Middle = 1,
+      Right = 2,
+      Move = 3,
+      WheelUp = 65,
+      WheelDown = 66,
+    };
+    enum class modifiers : u8 {
+      None = 0,
+      Button1 = 0,
+      Button2 = 1,
+      Button3 = 2,
+      Unused = 3, // Extended mode only use this to indicate drag
+      Shift = 4,
+      Alt = 8,
+      Ctrl = 16,
+      Release = 32,
+      Move = 35, // Release + Release (Unused) == drag
+      WheelUp = 64,
+      WheelDown = 65,
+      Key_Marker = 1 << 7,
+    };
+
+    explicit constexpr mouse() = default;
+    explicit constexpr mouse(modifiers magic, term_position pos) noexcept
+        : x{pos.col}, y{pos.row}, mods(magic) {}
+    explicit constexpr mouse(buttons button, term_position pos) noexcept
+        : x{pos.col}, y{pos.row}, mods((modifiers)button) {}
+
+    u16 x;
+    u16 y;
+    u8 _padding[3];
+    modifiers mods;
+
+    [[nodiscard]] constexpr buttons button() const noexcept {
+      return (buttons)(mods ^ (modifiers::Release | modifiers::Shift |
+                               modifiers::Alt | modifiers::Ctrl));
+    }
+
+    [[nodiscard]] constexpr bool is_pressed() const noexcept {
+      return (mods & modifiers::Release) != modifiers::None;
+    }
+
+    [[nodiscard]] constexpr bool is_released() const noexcept {
+      return (mods & modifiers::Release) == modifiers::None;
+    }
+
+    friend constexpr modifiers operator&(modifiers left,
+                                         modifiers right) noexcept {
+      return static_cast<modifiers>(static_cast<u8>(left) &
+                                    static_cast<u8>(right));
+    }
+    friend constexpr modifiers operator|(modifiers left,
+                                         modifiers right) noexcept {
+      return static_cast<modifiers>(static_cast<u8>(left) |
+                                    static_cast<u8>(right));
+    }
+    friend constexpr modifiers operator^(modifiers left,
+                                         modifiers right) noexcept {
+      return static_cast<modifiers>(static_cast<u8>(left) ^
+                                    static_cast<u8>(right));
+    }
+
+    friend constexpr bool same_button(mouse left, mouse right) noexcept {
+      return left.button() == right.button();
+    }
+
+    [[nodiscard]] constexpr bool ctrl_pressed() const {
+      return (mods & modifiers::Ctrl) == modifiers::Ctrl;
+    }
+
+    [[nodiscard]] constexpr bool alt_pressed() const {
+      return (mods & modifiers::Alt) == modifiers::Alt;
+    }
+
+    [[nodiscard]] constexpr bool shift_pressed() const {
+      return (mods & modifiers::Shift) == modifiers::Shift;
+    }
+  };
+
+  explicit constexpr event() noexcept : _cheat_{0} {}
+  constexpr event(key key) noexcept : key_{key} {}
+  constexpr event(mouse mouse) noexcept : mouse_{mouse} {}
   union {
-    event_key key;
-    event_mouse mouse;
+    key key_;
+    mouse mouse_;
     struct {
-      char data[7];
-      u8 mods;
-    } raw;
+      char data_[7];
+      u8 mods_;
+    };
     u64 _cheat_;
   };
 
-  constexpr static inline u8 MASK_TYPE_BIT = 0x80;
-  constexpr static inline u8 MODS_INDEX = 7;
-
-  [[nodiscard]] bool is_key_event() const {
-    return ((u8)event_mouse::modifiers::Key_Marker & raw.mods) != 0;
+  [[nodiscard]] bool is_key_event() const noexcept {
+    return ((u8)event::mouse::modifiers::Key_Marker & mods_) != 0;
   }
 
-  [[nodiscard]] bool is_mouse_event() const { return !is_key_event(); }
+  [[nodiscard]] bool is_mouse_event() const noexcept { return !is_key_event(); }
 
-  [[nodiscard]] bool alt_pressed() const {
-    return ((u8)event_mouse::modifiers::Alt & raw.mods) != 0;
+  [[nodiscard]] bool alt_pressed() const noexcept {
+    return ((u8)mouse::modifiers::Alt & mods_) != 0;
   }
 
-  [[nodiscard]] bool ctrl_pressed() const {
-    return ((u8)event_mouse::modifiers::Ctrl & raw.mods) != 0;
+  [[nodiscard]] bool ctrl_pressed() const noexcept {
+    return ((u8)mouse::modifiers::Ctrl & mods_) != 0;
   }
 
-  [[nodiscard]] bool shift_pressed() const {
-    return ((u8)event_mouse::modifiers::Shift & raw.mods) != 0;
+  [[nodiscard]] bool shift_pressed() const noexcept {
+    return ((u8)mouse::modifiers::Shift & mods_) != 0;
   }
 
-  friend constexpr bool operator==(event left, event right) {
+  friend constexpr bool operator==(event left, event right) noexcept {
     if (std::is_constant_evaluated()) {
       if (left.is_key_event()) {
-        return right.is_key_event() && left.key.code == right.key.code &&
-               left.key.mods == right.key.mods;
+        return right.is_key_event() && left.key_.code == right.key_.code &&
+               left.key_.mods == right.key_.mods;
       }
       return false;
     }
     return left._cheat_ == right._cheat_;
   }
-  constexpr static inline event_key arrow_up{'A',
-                                             event_key::modifiers::Special};
-  constexpr static inline event_key arrow_down{
-      event_key{'B', event_key::modifiers::Special}};
-  constexpr static inline event_key arrow_right{
-      event_key{'C', event_key::modifiers::Special}};
-  constexpr static inline event_key arrow_left{
-      event_key{'D', event_key::modifiers::Special}};
+
+  [[nodiscard]] constexpr key get_key() const noexcept {
+    if (!std::is_constant_evaluated()) {
+      assert(is_key_event());
+    }
+    return key_;
+  }
+  [[nodiscard]] constexpr key &get_key() noexcept {
+    if (!std::is_constant_evaluated()) {
+      assert(is_key_event());
+    }
+    return key_;
+  }
+
+  [[nodiscard]] constexpr mouse get_mouse() const noexcept {
+    if (!std::is_constant_evaluated()) {
+      assert(is_mouse_event());
+    }
+    return mouse_;
+  }
+  [[nodiscard]] constexpr mouse &get_mouse() noexcept {
+    if (!std::is_constant_evaluated()) {
+      assert(is_mouse_event());
+    }
+    return mouse_;
+  }
 };
 static_assert(sizeof(event) == 8);
+namespace term_events {
+
+template <typename EvType, typename EvType::modifiers Mod>
+struct dsl_event_modifier {};
+template <event::key::modifiers mod>
+using dsl_key_modifier = dsl_event_modifier<event::key, mod>;
+
+template <event::key::modifiers left, event::key::modifiers right>
+constexpr dsl_key_modifier<left | right>
+operator+(dsl_key_modifier<left> /*ignored*/,
+          dsl_key_modifier<right> /*ignored*/) noexcept {
+  return {};
+}
+
+constexpr static inline auto ctrl =
+    dsl_key_modifier<event::key::modifiers::Ctrl>{};
+constexpr static inline auto alt =
+    dsl_key_modifier<event::key::modifiers::Alt>{};
+constexpr static inline auto shift =
+    dsl_key_modifier<event::key::modifiers::Shift>{};
+constexpr static inline auto meta = alt;
+
+template <event::key::modifiers mod>
+constexpr event::key operator+(dsl_key_modifier<mod> /*ignored*/,
+                               event::key event) noexcept {
+  event.mods = mod | event.mods;
+  return event;
+}
+
+template <event::key::modifiers mod>
+constexpr event::key operator+(dsl_key_modifier<mod> /*ignored*/,
+                               char c) noexcept {
+  return event::key{c, mod};
+}
+
+template <class T> struct dsl_modifier_fuzzy {
+  using type = T;
+};
+
+template <event::key::modifiers M>
+dsl_modifier_fuzzy<dsl_key_modifier<M>>
+operator~(dsl_key_modifier<M> /*ignored*/) {
+  return {};
+}
+
+template <event::key::modifiers M>
+constexpr bool operator==(event::key key,
+                          dsl_modifier_fuzzy<dsl_key_modifier<M>> mod) {
+  return (key.mods & M) == M;
+}
+
+constexpr static inline event::key arrow_up{'A',
+                                            event::key::modifiers::Special};
+constexpr static inline event::key arrow_down{'B',
+                                              event::key::modifiers::Special};
+constexpr static inline event::key arrow_right{'C',
+                                               event::key::modifiers::Special};
+constexpr static inline event::key arrow_left{'D',
+                                              event::key::modifiers::Special};
+constexpr static inline event::key f1{'P', event::key::modifiers::Special};
+constexpr static inline event::key f2{'Q', event::key::modifiers::Special};
+constexpr static inline event::key f3{'R', event::key::modifiers::Special};
+constexpr static inline event::key f4{'S', event::key::modifiers::Special};
+constexpr static inline event::key f5{15, event::key::modifiers::Special};
+constexpr static inline event::key f6{17, event::key::modifiers::Special};
+constexpr static inline event::key f7{18, event::key::modifiers::Special};
+constexpr static inline event::key f8{19, event::key::modifiers::Special};
+constexpr static inline event::key f9{20, event::key::modifiers::Special};
+constexpr static inline event::key f10{21, event::key::modifiers::Special};
+constexpr static inline event::key f11{23, event::key::modifiers::Special};
+constexpr static inline event::key f12{24, event::key::modifiers::Special};
+constexpr static inline event::key backspace{127};
+constexpr static inline event::key enter{'j', event::key::modifiers::Ctrl};
+constexpr static inline event::key esc{27};
+constexpr static inline event::key home{1, event::key::modifiers::Special};
+constexpr static inline event::key ins{2, event::key::modifiers::Special};
+constexpr static inline event::key del{3, event::key::modifiers::Special};
+constexpr static inline event::key end{4, event::key::modifiers::Special};
+constexpr static inline event::key page_up{5, event::key::modifiers::Special};
+constexpr static inline event::key page_down{6, event::key::modifiers::Special};
+constexpr static inline event::key special_event{(char)0xFF, event::key::modifiers::Special};
+
+template <size_t N> struct fixed_string {
+  constexpr fixed_string(const char (&b)[N]) noexcept {
+    for (size_t i = 0; i < N; ++i) {
+      value[i] = b[i];
+    }
+  }
+  char value[N];
+};
+template <size_t N> fixed_string(const char (&)[N]) -> fixed_string<N>;
+
+template <fixed_string F> constexpr event::key operator""_key() {
+  constexpr auto f = F;
+  return event::key{f.value[0]};
+}
+
+} // namespace term_events
 
 namespace detail {
 
@@ -382,12 +637,11 @@ public:
 
   [[nodiscard]] struct term_position cursor_position() const {
     (void)this; // This is intentionally not static
-    constexpr static term_position invalid_pos = {(u16)0xFFFFFFFF,
-                                                  (u16)0xFFFFFFFF};
+    constexpr static term_position invalid_pos = {(u16)0xFFFF, (u16)0xFFFF};
     struct term_position p = {.col = 0, .row = 0};
     char buf[32];
     ssize_t i = 0; // Number of known characters in the buffer
-    write(STDOUT_FILENO, "\033[6n", 4);
+    query_cursor_position();
 
     enum class state : char {
       start,
@@ -479,7 +733,7 @@ public:
     return p;
   }
 
-  template <size_t BufSize = 32, int Timeout = 0>
+  template <size_t BufSize = 32, int Timeout = -1>
   ::dpsg::generator<char> input_stream() {
     (void)this;
     pollfd fds;
@@ -517,67 +771,81 @@ public:
     throw errno_exception{};
   }
 
+  void prompt_cursor_position() {}
+
 private:
   constexpr static inline u8 UPPER_BOUND_CTRL_CHARACTERS =
       32; // 32 first values represent ctrl+<char>. 0 is ctrl+` for some reason
 
-  static void from_character(char c, event_key::modifiers mod, event &out) {
-    if (c < UPPER_BOUND_CTRL_CHARACTERS) { // CTRL+<char> is sent as (<char> -
-                                           // 'A' + 1)
-      out = event{
-          event_key{(char)(c + 'a' - 1), mod | event_key::modifiers::Ctrl}};
-      //} else if ((c & 0b11000000) != 0) { // unicode continuation
-      // TODO : implement unicode characters
-      // out = event{event::build_key, (char)c, mod};
-    } else {
-      out = event{event_key{(char)c, mod}};
+  // Return the expected amount of unicode continuation characters
+  static size_t from_character(char c, event::key::modifiers mod, event &out) {
+    // CTRL+<char> is sent as (<char> - 'A' + 1). For some reason, '`' is sent
+    // as 0.
+    if ((((u32)c >> 6) & 0b11) == 0b11) { // unicode continuation
+      out = event{event::key{(char)c, mod}};
+      return out.get_key().code_point_count() - 1;
     }
+    if (c < UPPER_BOUND_CTRL_CHARACTERS) {
+      out = event{event::key{(char)(c == 0 ? '`' : c + 'a' - 1),
+                             mod | event::key::modifiers::Ctrl}};
+      return 0;
+    }
+
+    out = event{event::key{(char)c, mod}};
+    return 0;
   };
 
-  static void parse_mouse(const u16 *numbers, event_mouse::modifiers mods,
+  static void parse_mouse(const u16 *numbers, event::mouse::modifiers mods,
                           event &ev) {
-    auto magic = (event_mouse::modifiers)numbers[0];
+    auto magic = (event::mouse::modifiers)numbers[0];
     auto x = numbers[1];
     auto y = numbers[2];
-    ev = event_mouse{mods | magic, {.x = x, .y = y}};
+    ev = event::mouse{mods | magic, {.x = x, .y = y}};
   }
 
   static event parse_function_key(char c, event base, u16 modifiers) {
-    base.key.code = c;
-    switch ((event_key::funckey_modifiers)modifiers) {
-    case event_key::funckey_modifiers::Alt:
-      base.key.mods = base.key.mods | event_key::modifiers::Alt;
+    base.get_key().code = c;
+    switch ((event::key::funckey_modifiers)modifiers) {
+    case event::key::funckey_modifiers::Alt:
+      base.get_key().mods = base.get_key().mods | event::key::modifiers::Alt;
       break;
-    case event_key::funckey_modifiers::Shift:
-      base.key.mods = base.key.mods | event_key::modifiers::Shift;
+    case event::key::funckey_modifiers::Shift:
+      base.get_key().mods = base.get_key().mods | event::key::modifiers::Shift;
       break;
-    case event_key::funckey_modifiers::Shift_Alt:
-      base.key.mods = base.key.mods | event_key::modifiers::Shift;
-      base.key.mods = base.key.mods | event_key::modifiers::Alt;
+    case event::key::funckey_modifiers::Shift_Alt:
+      base.get_key().mods = base.get_key().mods | event::key::modifiers::Shift;
+      base.get_key().mods = base.get_key().mods | event::key::modifiers::Alt;
       break;
-    case event_key::funckey_modifiers::Control:
-      base.key.mods = base.key.mods | event_key::modifiers::Ctrl;
+    case event::key::funckey_modifiers::Control:
+      base.get_key().mods = base.get_key().mods | event::key::modifiers::Ctrl;
       break;
-    case event_key::funckey_modifiers::Shift_Control:
-      base.key.mods = base.key.mods | event_key::modifiers::Shift;
-      base.key.mods = base.key.mods | event_key::modifiers::Ctrl;
+    case event::key::funckey_modifiers::Shift_Control:
+      base.get_key().mods = base.get_key().mods | event::key::modifiers::Shift;
+      base.get_key().mods = base.get_key().mods | event::key::modifiers::Ctrl;
       break;
-    case event_key::funckey_modifiers::Alt_Control:
-      base.key.mods = base.key.mods | event_key::modifiers::Alt;
-      base.key.mods = base.key.mods | event_key::modifiers::Ctrl;
+    case event::key::funckey_modifiers::Alt_Control:
+      base.get_key().mods = base.get_key().mods | event::key::modifiers::Alt;
+      base.get_key().mods = base.get_key().mods | event::key::modifiers::Ctrl;
       break;
-    case event_key::funckey_modifiers::Shift_Alt_Control:
-      base.key.mods = base.key.mods | event_key::modifiers::Alt;
-      base.key.mods = base.key.mods | event_key::modifiers::Ctrl;
-      base.key.mods = base.key.mods | event_key::modifiers::Shift;
+    case event::key::funckey_modifiers::Shift_Alt_Control:
+      base.get_key().mods = base.get_key().mods | event::key::modifiers::Alt;
+      base.get_key().mods = base.get_key().mods | event::key::modifiers::Ctrl;
+      base.get_key().mods = base.get_key().mods | event::key::modifiers::Shift;
       break;
     }
     return base;
   }
 
 public:
+  void query_cursor_position() const {
+    (void)this;
+    ::dpsg::query_cursor_position();
+  }
+
+  term_position cursor_position_{0xFFFF, 0xFFFF};
+
   template <size_t BufSize = 32, int Timeout = 0>
-  ::dpsg::generator<event> event_stream() {
+  ::dpsg::generator<std::pair<event, std::string>> event_stream() {
     (void)this;
     pollfd fds;
     fds.fd = STDIN_FILENO;
@@ -587,10 +855,17 @@ public:
       expecting_first,
       expecting_control_character,
       expecting_control_sequence,
-      parsing_number
+      parsing_number,
+      expecting_unicode,
+      expecting_sun_function_key,
     };
 
-    for (;;) {
+    int first_buffer_char = 0;
+    u8 expected_code_points = 0;
+    u8 current_code_point = 0;
+    event result;
+
+    for (;;) { // BEGIN LOOP_OVER_POLL
       auto poll_result = poll(&fds, 1, Timeout);
       if (poll_result == -1) {
         if (errno == EINTR) {
@@ -605,49 +880,102 @@ public:
 
       int last = 0;
       char buffer[BufSize];
-      last = read(STDIN_FILENO, buffer, sizeof(buffer));
+      last = read(STDIN_FILENO, buffer + first_buffer_char,
+                  sizeof(buffer) - first_buffer_char);
       if (last == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
         continue;
       }
+      last += first_buffer_char;
 
-      parse_state state{parse_state::expecting_first};
-      int current = 0;
-      char control_character = 0;
-      u16 num_parameters[4] = {0};
-      u16 *current_param = num_parameters;
-      event result;
-      const auto reset = [&] {
+      parse_state state{parse_state::expecting_first}; // FSM state
+      int current = 0; // Index of the current character in the buffer
+      int start_of_new_sequence =
+          0; // Where is the start of the current control sequence
+      char control_character = 0; // What's the character right after ^[
+      u16 num_parameters[4] = {
+          0}; // Numeric parameters parsed from a control sequence
+      u16 *current_param =
+          num_parameters; // Pointer to the number being parsed. Keep it inside
+                          // num_parameters
+
+      const auto finalize_parse = [&] {
+        // Reset state for the next parse
         state = parse_state::expecting_first;
-        do {
+        do { // reset current_param and num_parameters to 0 (yes, it works)
           *current_param = 0;
         } while ((current_param != num_parameters) && (current_param--, true));
+
+        start_of_new_sequence = current;
         result = event{};
+        current_code_point = 0;
+        first_buffer_char = 0;
       };
+      const auto yield = [&] {
+        auto r = result;
+        finalize_parse();
+        // return the result
+        return std::pair<event, std::string>{
+            r, std::string{buffer, buffer + last}};
+      };
+
+      // BEGIN LOOP_OVER_BUFFER
       while (current < last) {
         char c = buffer[current++];
 
+        if (expected_code_points != 0) {
+
+          result.get_key().data[++current_code_point] = c;
+          expected_code_points--;
+
+          if (expected_code_points == 0) {
+            result.get_key().mods =
+                result.get_key().mods | event::key::modifiers::Unicode;
+            co_yield yield();
+          }
+
+          continue;
+        }
+
         switch (state) {
+
         case parse_state::expecting_first: {
-          if (c == '\033') { // Control character
+          if (c == '\033') {
+            // Control character, expect this to be a control sequence
+            // If it isn't (ESC or Alt char), the buffer will end there, and
+            // we'll deal with the event at the end of the loop
             state = parse_state::expecting_control_character;
           } else {
-            from_character(c, event_key::modifiers::None, result);
-            co_yield result;
-            reset();
+            expected_code_points =
+                from_character(c, event::key::modifiers::None, result);
+            if (expected_code_points == 0) {
+              co_yield yield();
+            }
           }
           break;
-        }
+        } // parse_state::expecting_first:
+
         case parse_state::expecting_control_character: {
-          if (c == '[') { // Control !
+          switch (c) {
+          case '[': { // Control !
             state = parse_state::expecting_control_sequence;
             control_character = c;
-          } else {
-            from_character(c, event_key::modifiers::Alt, result);
-            co_yield result;
-            reset();
+            break;
+          }
+          case 'O': {
+            state = parse_state::expecting_sun_function_key;
+            break;
+          }
+          default: {
+            expected_code_points =
+                from_character(c, event::key::modifiers::Alt, result);
+            if (expected_code_points == 0) {
+              co_yield yield();
+            }
+          }
           }
           break;
-        }
+        } // parse_state::expecting_control_character
+
         case parse_state::expecting_control_sequence: {
           if (isdigit(c)) {
             state = parse_state::parsing_number;
@@ -659,32 +987,33 @@ public:
               break;
             }
             case 'A': {
-              co_yield event::arrow_up;
-              reset();
+              result = term_events::arrow_up;
+              co_yield yield();
               break;
             }
             case 'B': {
-              co_yield event::arrow_down;
-              reset();
+              result = term_events::arrow_down;
+              co_yield yield();
               break;
             }
             case 'C': {
-              co_yield event::arrow_right;
-              reset();
+              result = term_events::arrow_right;
+              co_yield yield();
               break;
             }
             case 'D': {
-              co_yield event::arrow_left;
-              reset();
+              result = term_events::arrow_left;
+              co_yield yield();
               break;
             }
             default: {
-              throw invalid_sequence_start(c);
+              throw invalid_sequence_start(buffer, last, c);
             }
             }
           }
           break;
-        }
+        } // case parse_state::expecting_control_sequence
+
         case parse_state::parsing_number: {
           if (isdigit(c)) {
             *current_param = (*current_param * 10) + (c - '0');
@@ -700,78 +1029,200 @@ public:
             case 'm': {
               assert(current_param == num_parameters + 2 &&
                      "Mouse events require exactly 3 values");
-              parse_mouse(num_parameters, event_mouse::modifiers::Release,
+              parse_mouse(num_parameters, event::mouse::modifiers::Release,
                           result);
-              co_yield result;
-              reset();
+              co_yield yield();
               break;
             }
             case 'M': {
               assert(current_param == num_parameters + 2 &&
                      "Mouse events require exactly 3 values");
-              parse_mouse(num_parameters, event_mouse::modifiers::None, result);
-              co_yield result;
-              reset();
+              parse_mouse(num_parameters, event::mouse::modifiers::None,
+                          result);
+              co_yield yield();
               break;
             }
             case 'A': {
               assert(num_parameters[0] == 1 &&
                      current_param == num_parameters + 1 &&
                      "Unknown sequence for arrow key!");
-              result =
-                  parse_function_key(c, event::arrow_up, num_parameters[1]);
-              co_yield result;
-              reset();
+              result = parse_function_key(c, term_events::arrow_up,
+                                          num_parameters[1]);
+              co_yield yield();
               break;
             }
             case 'B': {
               assert(num_parameters[0] == 1 &&
                      current_param == num_parameters + 1 &&
                      "Unknown sequence for arrow key!");
-              result =
-                  parse_function_key(c, event::arrow_down, num_parameters[1]);
-              co_yield result;
-              reset();
+              result = parse_function_key(c, term_events::arrow_down,
+                                          num_parameters[1]);
+              co_yield yield();
               break;
             }
             case 'C': {
               assert(num_parameters[0] == 1 &&
                      current_param == num_parameters + 1 &&
                      "Unknown sequence for arrow key!");
-              result =
-                  parse_function_key(c, event::arrow_right, num_parameters[1]);
-              co_yield result;
-              reset();
+              result = parse_function_key(c, term_events::arrow_right,
+                                          num_parameters[1]);
+              co_yield yield();
               break;
             }
             case 'D': {
               assert(num_parameters[0] == 1 &&
                      current_param == num_parameters + 1 &&
                      "Unknown sequence for arrow key!");
+              result = parse_function_key(c, term_events::arrow_left,
+                                          num_parameters[1]);
+              co_yield yield();
+              break;
+            }
+            case 'P': {
+              assert(num_parameters[0] == 1 &&
+                     current_param == num_parameters + 1 &&
+                     "Unknown sequence for function key!");
               result =
-                  parse_function_key(c, event::arrow_left, num_parameters[1]);
-              co_yield result;
-              reset();
+                  parse_function_key(c, term_events::f1, num_parameters[1]);
+              co_yield yield();
+              break;
+            }
+            case 'Q': {
+              assert(num_parameters[0] == 1 &&
+                     current_param == num_parameters + 1 &&
+                     "Unknown sequence for function key!");
+              result =
+                  parse_function_key(c, term_events::f2, num_parameters[1]);
+              co_yield yield();
+              break;
+            }
+            case 'R': {
+              if (current_param == num_parameters + 1) {
+                assert(num_parameters[0] == 1 &&
+                       "Unknown sequence for function key!");
+                result =
+                    parse_function_key(c, term_events::f3, num_parameters[1]);
+                co_yield yield();
+              } else if (current_param ==
+                         num_parameters + 2) { // Cursor position
+                cursor_position_ = term_position{.x = num_parameters[1],
+                                                 .y = num_parameters[0]};
+                finalize_parse();
+              }
+              break;
+            }
+            case 'S': {
+              assert(num_parameters[0] == 1 &&
+                     current_param == num_parameters + 1 &&
+                     "Unknown sequence for function key!");
+              result =
+                  parse_function_key(c, term_events::f4, num_parameters[1]);
+              co_yield yield();
+              break;
+            }
+            case '~': { // extension function key
+              assert(current_param <= num_parameters + 1 &&
+                     "Unknown numeric sequence for extended function key");
+
+              result = parse_function_key(
+                  (char)num_parameters[0],
+                  // This doesn't matter, the actual code is drawn from the
+                  // first parameter
+                  term_events::f4,
+                  // If we didn't get a modifier key, send 1 (no mod)
+                  (current_param == num_parameters + 1) ? num_parameters[1]
+
+                                                        : 1);
+              co_yield yield();
               break;
             }
             default: {
-              throw unfinished_numeric_sequence(num_parameters,
+              throw unfinished_numeric_sequence(buffer, last, num_parameters,
                                                 current_param + 1, c);
             }
-            }
+            } // switch(c)
             break;
           }
+          break;
+        } // case parse_state::parsing_number
+        case parse_state::expecting_sun_function_key: {
+          switch (c) {
+          case 'P':
+            result = term_events::f1;
+            co_yield yield();
+            break;
+          case 'Q':
+            result = term_events::f2;
+            co_yield yield();
+            break;
+          case 'R':
+            result = term_events::f3;
+            co_yield yield();
+            break;
+          case 'S':
+            result = term_events::f4;
+            co_yield yield();
+            break;
+          default:
+            throw invalid_function_key(buffer, last, c);
+          }
+          break;
+        } // case parse_state::expecting_sun_function_key
+
+        } // switch(state)
+
+      } // END LOOP_OVER_BUFFER
+
+      // Alt keys are sent as ^[<char>. If events come really fast, or
+      // accumulate in the buffer a long time, it may be difficult to
+      // differentiate between the start of a control sequence and a regular
+      // Alt/Esc char. Using a bigger buffer may help. In the absence of a
+      // better solution, we'll consider that an alt character cannot appear at
+      // the end of the buffer That's obviously not true, but should be enough
+      // for most cases
+      const auto copy_leftover_to_beginning = [&] {
+        // End of sequence is 1 behind beginning of new one
+        for (auto x = 0; x < (last - start_of_new_sequence + 1); ++x) {
+          buffer[x] = buffer[start_of_new_sequence + x];
         }
+        first_buffer_char = last - start_of_new_sequence;
+      };
+
+      switch (state) {
+      case parse_state::expecting_control_sequence: {
+        // This is a legitimate Alt char.
+        if (last != BufSize) {
+          from_character(control_character, event::key::modifiers::Alt, result);
+          co_yield yield();
+        } else {
+          // We have and unfinished sequence on our hands. We'll copy it at the
+          // beginning and tell read() to use a smaller buffer for the next pass
+          copy_leftover_to_beginning();
         }
-      }
-      if (state ==
-          parse_state::expecting_control_sequence) { // The control char
-                                                     // is actually an
-                                                     // Alt+<ctrl char>
-        from_character(control_character, event_key::modifiers::Alt, result);
-        co_yield result;
-      }
-    }
+        break;
+      } // case parse_state::expecting_control_character
+
+      case parse_state::expecting_control_character: {
+        // Legitimate Esc
+        if (last != BufSize) {
+          result = event::key{'\033'};
+          co_yield yield();
+        }
+      } // case parse_state::expecting_control_character
+
+      case parse_state::expecting_first: {
+        break; // We're not in the middle of a parse, nothing to do at this
+               // point.
+      }        // case parse_state::expecting_first
+
+      default:
+        // We're in the middle of a parse, but the result is entirely determined
+        // by what follows
+        copy_leftover_to_beginning();
+
+      } // switch(state)
+
+    } // END LOOP_OVER_POLL
 
     throw errno_exception{};
   }
